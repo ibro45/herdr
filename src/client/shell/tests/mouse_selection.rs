@@ -1230,3 +1230,191 @@ fn context_menu_keyboard_and_outside_click_are_client_owned() {
     assert!(outside.repaint);
     assert!(state.overlay.is_none());
 }
+
+#[test]
+fn spaces_tree_folds_one_space_and_focuses_a_tab_in_another() {
+    let config: Config = toml::from_str("[ui.sidebar.spaces]\nunified_tree = true").unwrap();
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
+    let mut data = snapshot();
+    let mut other = data.workspaces[0].clone();
+    other.workspace_id = "other".into();
+    other.active_tab_id = "other-tab".into();
+    other.focused = false;
+    data.workspaces.push(other);
+    let mut tab = data.tabs[0].clone();
+    tab.workspace_id = "other".into();
+    tab.tab_id = "other-tab".into();
+    tab.focused = false;
+    data.tabs.push(tab);
+    state.set_snapshot(Box::new(data));
+    state.set_pane_surface(surface());
+    state.compose(106, 40).unwrap();
+    assert_eq!(state.hits.space_tabs.len(), 2);
+    let click = |state: &mut ClientShellState, rect: Rect| {
+        state.handle_raw_events(vec![RawInputEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x,
+            row: rect.y,
+            modifiers: KeyModifiers::empty(),
+        })])
+    };
+    let fold = state.hits.workspaces[0].rect;
+    assert!(click(&mut state, fold).actions.is_empty());
+    state.handle_raw_events(vec![RawInputEvent::Mouse(MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        column: fold.x,
+        row: fold.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+    state.compose(106, 40).unwrap();
+    assert_eq!(state.hits.space_tabs.len(), 1);
+    let remaining = state.hits.space_tabs[0].0;
+    let outcome = click(&mut state, remaining);
+    assert!(
+        matches!(&outcome.actions[..], [ClientShellAction::Endpoint { request, .. }]
+        if matches!(&request.method, crate::api::schema::Method::TabFocus(target) if target.tab_id == "other-tab"))
+    );
+}
+
+#[test]
+fn unified_space_renders_and_focuses_each_agent_in_a_shared_tab() {
+    let config: Config = toml::from_str(
+        r#"
+        [ui]
+        status_indicators = "symbols"
+        [ui.sidebar.spaces]
+        unified_tree = true
+        show_other_panes = true
+        [ui.sidebar.agents]
+        rows = [["state_icon", "workspace", "terminal_title_stripped"], ["$launcher"]]
+    "#,
+    )
+    .unwrap();
+    let mut data = snapshot();
+    // A filter on the separate Agents panel must not remove panes from the tree.
+    data.agent_view_label = Some("one matching agent".into());
+    data.agent_order = vec!["pane_1".into()];
+    for (id, title) in [("pane_1", "Alpha"), ("pane_2", "Beta")] {
+        data.agents.push(ClientShellAgent {
+            pane_id: id.into(),
+            workspace_id: "ws_1".into(),
+            tab_id: "tab_1".into(),
+            name: None,
+            display_agent: None,
+            agent: None,
+            title: None,
+            terminal_title: None,
+            terminal_title_stripped: Some(title.into()),
+            agent_status: if id == "pane_1" {
+                AgentStatus::Working
+            } else {
+                AgentStatus::Blocked
+            },
+            state_change_seq: 1,
+            state_labels: Vec::new(),
+            tokens: vec![("launcher".into(), "shell".into())],
+            focused: id == "pane_1",
+        });
+    }
+    data.panes.push(ClientShellPane {
+        pane_id: "shell_1".into(),
+        label: Some("File viewer".into()),
+        focused: false,
+        ..data.panes[0].clone()
+    });
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
+    state.set_snapshot(Box::new(data));
+    state.set_pane_surface(surface());
+    let frame = state.compose(106, 40).unwrap();
+    assert!(state.hits.sidebar_section_divider.is_empty());
+    assert!(state.hits.agent_body.is_empty());
+    assert!(state.hits.space_tabs.is_empty());
+    assert_eq!(state.hits.agents.len(), 3);
+    let lines = frame_rows(&frame);
+    let shell = state
+        .hits
+        .agents
+        .iter()
+        .find(|(_, id)| id == "shell_1")
+        .unwrap()
+        .0;
+    assert!(lines[usize::from(shell.y)].contains("File viewer"));
+    let mouse = |kind| {
+        RawInputEvent::Mouse(MouseEvent {
+            kind,
+            column: shell.x + 4,
+            row: shell.y,
+            modifiers: KeyModifiers::empty(),
+        })
+    };
+    let click_shell = state.handle_raw_events(vec![mouse(MouseEventKind::Down(MouseButton::Left))]);
+    assert!(
+        matches!(&click_shell.actions[..], [ClientShellAction::Endpoint { request, .. }]
+        if matches!(&request.method, crate::api::schema::Method::PaneFocus(target) if target.pane_id == "shell_1"))
+    );
+    state.handle_raw_events(vec![mouse(MouseEventKind::Down(MouseButton::Right))]);
+    assert!(matches!(
+        state.overlay,
+        Some(ClientShellOverlay::ContextMenu(_))
+    ));
+    state.overlay = None;
+    for ((rect, id), title) in state.hits.agents.clone().iter().zip(["Alpha", "Beta"]) {
+        assert_eq!(rect.height, 2);
+        assert!(lines[usize::from(rect.y)].contains(title));
+        assert!(!lines[usize::from(rect.y)].contains("client-shell"));
+        assert!(lines[usize::from(rect.y + 1)].contains("shell"));
+        for y in rect.y..rect.bottom() {
+            let cell = &frame.cells[usize::from(y * frame.width + rect.x)];
+            if id == "pane_1" {
+                assert_eq!(cell.symbol, "▌");
+                assert_eq!(
+                    cell.fg,
+                    crate::protocol::color_to_u32(state.config.palette.accent)
+                );
+            } else {
+                assert_ne!(cell.symbol, "▌");
+            }
+        }
+        let outcome = state.handle_raw_events(vec![RawInputEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x,
+            row: rect.y + 1,
+            modifiers: KeyModifiers::empty(),
+        })]);
+        assert!(
+            matches!(&outcome.actions[..], [ClientShellAction::Endpoint { request, .. }]
+            if matches!(&request.method, crate::api::schema::Method::PaneFocus(target) if &target.pane_id == id))
+        );
+    }
+    let heading = state.hits.workspaces[0].rect;
+    let click = |state: &mut ClientShellState, release_y| {
+        state.handle_raw_events(vec![
+            RawInputEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: heading.x + 3,
+                row: heading.y,
+                modifiers: KeyModifiers::empty(),
+            }),
+            RawInputEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: heading.x + 3,
+                row: release_y,
+                modifiers: KeyModifiers::empty(),
+            }),
+        ])
+    };
+    assert!(click(&mut state, heading.bottom()).actions.is_empty());
+    state.compose(106, 40).unwrap();
+    assert_eq!(state.hits.agents.len(), 3);
+    assert!(click(&mut state, heading.y).actions.is_empty());
+    let folded = state.compose(106, 40).unwrap();
+    assert!(state.hits.agents.is_empty());
+    let header = &frame_rows(&folded)[usize::from(heading.y)];
+    assert!(header.starts_with("client-shell × 1 ◐ 1"), "{header}");
+    assert!(
+        header[..header.find('│').unwrap()]
+            .trim_end()
+            .ends_with("[2]"),
+        "{header}"
+    );
+}

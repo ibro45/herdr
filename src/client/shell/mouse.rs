@@ -1370,7 +1370,18 @@ impl ClientShellState {
                 return;
             }
             if let Some(press) = self.workspace_press.take() {
-                self.finish_endpoint_workspace_press(press, outcome);
+                if self.hits.unified_spaces {
+                    if self.hits.workspaces.iter().any(|hit| {
+                        hit.workspace_id == press.workspace_id
+                            && hit.endpoint_id == press.endpoint_id
+                            && super::contains(hit.rect, point)
+                    }) {
+                        self.toggle_space_fold(press.workspace_id);
+                        outcome.repaint = true;
+                    }
+                } else {
+                    self.finish_endpoint_workspace_press(press, outcome);
+                }
                 return;
             }
             if let Some(press) = self.tab_press.take() {
@@ -1843,6 +1854,18 @@ impl ClientShellState {
                     outcome.repaint = true;
                     return;
                 }
+                if self.hits.unified_spaces {
+                    let row = self
+                        .hits
+                        .agents
+                        .iter()
+                        .find(|(rect, _)| super::contains(*rect, point));
+                    if let Some((_, pane_id)) = row {
+                        self.open_pane_context_menu(pane_id.clone(), mouse.column, mouse.row);
+                        outcome.repaint = true;
+                        return;
+                    }
+                }
                 let tab_id = self
                     .hits
                     .tabs
@@ -2086,6 +2109,20 @@ impl ClientShellState {
                         .saturating_add(1)
                         .min(tab_count.saturating_sub(1));
                     outcome.repaint = true;
+                    return;
+                }
+                if let Some((_, tab_id)) = self
+                    .hits
+                    .space_tabs
+                    .iter()
+                    .find(|(rect, _)| super::contains(*rect, point))
+                {
+                    self.push_endpoint_method(
+                        crate::api::schema::Method::TabFocus(crate::api::schema::TabTarget {
+                            tab_id: tab_id.clone(),
+                        }),
+                        outcome,
+                    );
                     return;
                 }
                 let group_toggle = self.hits.workspaces.iter().find_map(|hit| {

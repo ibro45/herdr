@@ -4,7 +4,7 @@ use ratatui::{
     buffer::Buffer,
     layout::Rect,
     style::{Modifier, Style},
-    text::Line,
+    text::{Line, Span},
     widgets::{Paragraph, Widget},
 };
 
@@ -15,6 +15,7 @@ pub(super) struct AgentRow {
     pub(super) status: crate::api::schema::AgentStatus,
     pub(super) focused: bool,
     pub(super) rows: Vec<Vec<crate::ui::ResolvedToken>>,
+    unified: bool,
 }
 
 pub(super) fn ordered_agent_pane_ids(
@@ -255,6 +256,58 @@ pub(super) fn agent_row(
         .agents
         .iter()
         .find(|agent| agent.pane_id == pane_id)?;
+    agent_row_for(snapshot, agent, config, machine)
+}
+
+pub(super) fn unified_agent_row(
+    snapshot: &ClientShellSnapshot,
+    agent: &crate::protocol::ClientShellAgent,
+    config: &ClientShellConfig,
+) -> Option<AgentRow> {
+    let mut row = agent_row_for(snapshot, agent, config, None)?;
+    row.unified = true;
+    for tokens in &mut row.rows {
+        tokens.retain(|token| !matches!(token.kind, crate::ui::ResolvedTokenKind::Workspace(_)));
+    }
+    row.rows.retain(|tokens| !tokens.is_empty());
+    if row.rows.is_empty() {
+        row.rows.push(vec![crate::ui::ResolvedToken {
+            kind: crate::ui::ResolvedTokenKind::StateIcon,
+            style: Default::default(),
+        }]);
+    }
+    let first = &mut row.rows[0];
+    if first.iter().all(|t| {
+        matches!(
+            t.kind,
+            crate::ui::ResolvedTokenKind::StateIcon | crate::ui::ResolvedTokenKind::StateText(_)
+        )
+    }) {
+        let label = [
+            agent.terminal_title_stripped.as_deref(),
+            agent.title.as_deref(),
+            agent.display_agent.as_deref(),
+            agent.name.as_deref(),
+            agent.agent.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|label| !label.trim().is_empty())
+        .unwrap_or(&agent.pane_id);
+        first.push(crate::ui::ResolvedToken {
+            kind: crate::ui::ResolvedTokenKind::TerminalTitle(label.to_owned()),
+            style: Default::default(),
+        });
+    }
+    Some(row)
+}
+
+fn agent_row_for(
+    snapshot: &ClientShellSnapshot,
+    agent: &crate::protocol::ClientShellAgent,
+    config: &ClientShellConfig,
+    machine: Option<&str>,
+) -> Option<AgentRow> {
     let workspace = snapshot
         .workspaces
         .iter()
@@ -315,6 +368,7 @@ pub(super) fn agent_row(
         status: agent.agent_status,
         focused: agent.focused,
         rows,
+        unified: false,
     })
 }
 
@@ -355,22 +409,82 @@ pub(super) fn render_agent_row(
     };
     for (index, tokens) in rows.iter().take(rect.height as usize).enumerate() {
         let indent = if index == 0 { 1 } else { 3 };
-        let mut spans = vec![ratatui::text::Span::raw(" ".repeat(indent))];
-        spans.extend(crate::ui::resolved_token_spans(
-            tokens,
-            icon,
-            status_style,
-            name_style,
-            secondary,
-            secondary,
-            palette,
-            rect.width.saturating_sub(indent as u16) as usize,
-        ));
+        let width = rect.width.saturating_sub(indent as u16) as usize;
+        let secondary = if row.unified && index > 0 {
+            Style::default()
+                .fg(palette.text)
+                .add_modifier(Modifier::DIM)
+        } else {
+            secondary
+        };
+        let custom_style = if row.unified && index == 0 {
+            Style::default().fg(palette.text)
+        } else {
+            secondary
+        };
+        let render_tokens = |tokens: &[crate::ui::ResolvedToken], width| {
+            crate::ui::resolved_token_spans(
+                tokens,
+                icon,
+                status_style,
+                name_style,
+                secondary,
+                custom_style,
+                palette,
+                width,
+            )
+        };
+        let mut spans = vec![Span::raw(" ".repeat(indent))];
+        if row.unified && index > 0 {
+            spans.extend(aligned_metadata(tokens, width, render_tokens));
+        } else {
+            spans.extend(render_tokens(tokens, width));
+        }
         Paragraph::new(Line::from(spans)).style(row_style).render(
             Rect::new(rect.x, rect.y + index as u16, rect.width, 1),
             buffer,
         );
     }
+}
+
+fn aligned_metadata(
+    tokens: &[crate::ui::ResolvedToken],
+    width: usize,
+    render: impl Fn(&[crate::ui::ResolvedToken], usize) -> Vec<Span<'static>>,
+) -> Vec<Span<'static>> {
+    let (left, launcher) = match tokens.split_last() {
+        Some((token, left)) if matches!(token.kind, crate::ui::ResolvedTokenKind::Agent(_)) => {
+            (left, render(std::slice::from_ref(token), width))
+        }
+        _ => (tokens, Vec::new()),
+    };
+    let launcher_width = launcher.iter().map(Span::width).sum::<usize>();
+    let left_limit = width.saturating_sub(launcher_width + 2 * usize::from(launcher_width > 0));
+    let mut spans = Vec::new();
+    let mut used = 0;
+    for token in left {
+        let gap = usize::from(used > 0);
+        let budget = left_limit.saturating_sub(used + gap);
+        if budget == 0 {
+            break;
+        }
+        let rendered = render(std::slice::from_ref(token), budget);
+        let rendered_width = rendered.iter().map(Span::width).sum::<usize>();
+        if rendered_width > 0 && rendered_width <= budget {
+            if gap > 0 {
+                spans.push(Span::raw(" "));
+            }
+            spans.extend(rendered);
+            used += gap + rendered_width;
+        }
+    }
+    if launcher_width > 0 {
+        spans.push(Span::raw(
+            " ".repeat(width.saturating_sub(used + launcher_width)),
+        ));
+        spans.extend(launcher);
+    }
+    spans
 }
 
 fn put_text(buffer: &mut Buffer, x: u16, y: u16, width: u16, text: &str, style: Style) {
@@ -392,5 +506,52 @@ fn sidebar_status_text(status: crate::api::schema::AgentStatus) -> &'static str 
         AgentStatus::Done => "done",
         AgentStatus::Working => "working",
         AgentStatus::Idle | AgentStatus::Unknown => "idle",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::{ResolvedToken, ResolvedTokenKind};
+
+    #[test]
+    fn unified_metadata_reserves_the_right_edge_for_the_launcher() {
+        let config = ClientShellConfig::from_config(&crate::config::Config::default());
+        let token = |kind| ResolvedToken {
+            kind,
+            style: Default::default(),
+        };
+        let mut row = AgentRow {
+            pane_id: "pane_1".into(),
+            status: crate::api::schema::AgentStatus::Idle,
+            focused: true,
+            rows: vec![
+                vec![
+                    token(ResolvedTokenKind::StateIcon),
+                    token(ResolvedTokenKind::TerminalTitle("Review".into())),
+                ],
+                vec![
+                    token(ResolvedTokenKind::Branch("feature/very-long-branch".into())),
+                    token(ResolvedTokenKind::Agent("podex".into())),
+                ],
+            ],
+            unified: true,
+        };
+        for (width, launcher) in [(6, "po…"), (9, "podex"), (18, "podex")] {
+            for focused in [true, false] {
+                row.focused = focused;
+                let rect = Rect::new(0, 0, width, 2);
+                let mut buffer = Buffer::empty(rect);
+                render_agent_row(&mut buffer, rect, &row, &config);
+                let metadata = (0..width)
+                    .map(|x| buffer[(x, 1)].symbol())
+                    .collect::<String>();
+                assert_eq!(metadata.starts_with("   f"), width == 18, "{metadata}");
+                assert!(!metadata.contains('·'), "{metadata}");
+                assert!(metadata.ends_with(launcher), "{metadata}");
+                assert_eq!(buffer[(3, 0)].modifier & Modifier::BOLD, Modifier::empty());
+                assert!(buffer[(width - 1, 1)].modifier.contains(Modifier::DIM));
+            }
+        }
     }
 }

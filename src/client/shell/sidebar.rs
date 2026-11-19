@@ -1,4 +1,5 @@
 use super::*;
+use crate::api::schema::AgentStatus;
 use ratatui::{
     text::Line,
     widgets::{Paragraph, Widget},
@@ -196,6 +197,101 @@ pub(crate) fn render_collapsed_sidebar(
     );
 }
 
+pub(in crate::client::shell) enum SpaceChild<'a> {
+    Agent(super::super::agent_sidebar::AgentRow),
+    Pane(&'a crate::protocol::ClientShellPane),
+    Tab(&'a ClientShellTab),
+}
+
+const FOLDED_STATUSES: [AgentStatus; 3] = [
+    AgentStatus::Blocked,
+    AgentStatus::Working,
+    AgentStatus::Done,
+];
+
+#[derive(Default)]
+struct FoldedSummary {
+    panes: usize,
+    statuses: [usize; FOLDED_STATUSES.len()],
+}
+
+fn render_pane_highlight(buffer: &mut Buffer, rect: Rect, indent: u16, palette: &Palette) {
+    if indent == 0 {
+        return;
+    }
+    buffer.set_style(rect, Style::default().bg(palette.active_row_bg));
+    for line in rect.y..rect.bottom() {
+        put_text(
+            buffer,
+            rect.x + indent - 1,
+            line,
+            1,
+            "▌",
+            Style::default().fg(palette.accent),
+        );
+    }
+}
+
+pub(in crate::client::shell) fn space_rows<'a>(
+    snapshot: &'a ClientShellSnapshot,
+    workspaces: Vec<WorkspaceEntry>,
+    config: &ClientShellConfig,
+    folded_spaces: &HashSet<String>,
+) -> Vec<(WorkspaceEntry, Option<SpaceChild<'a>>)> {
+    let mut children = HashMap::<&str, Vec<SpaceChild>>::new();
+    if config.spaces.unified_tree {
+        let mut children_by_tab = HashMap::<&str, Vec<SpaceChild>>::new();
+        let mut agent_panes = HashSet::new();
+        for agent in &snapshot.agents {
+            if folded_spaces.contains(&agent.workspace_id) {
+                continue;
+            }
+            if let Some(row) =
+                super::super::agent_sidebar::unified_agent_row(snapshot, agent, config)
+            {
+                agent_panes.insert(agent.pane_id.as_str());
+                children_by_tab
+                    .entry(&agent.tab_id)
+                    .or_default()
+                    .push(SpaceChild::Agent(row));
+            }
+        }
+        if config.spaces.show_other_panes {
+            for pane in &snapshot.panes {
+                if !folded_spaces.contains(&pane.workspace_id)
+                    && !agent_panes.contains(pane.pane_id.as_str())
+                {
+                    children_by_tab
+                        .entry(&pane.tab_id)
+                        .or_default()
+                        .push(SpaceChild::Pane(pane));
+                }
+            }
+        }
+        for tab in &snapshot.tabs {
+            if folded_spaces.contains(&tab.workspace_id) {
+                continue;
+            }
+            let rows = children.entry(&tab.workspace_id).or_default();
+            if let Some(children) = children_by_tab.remove(tab.tab_id.as_str()) {
+                rows.extend(children);
+            } else {
+                rows.push(SpaceChild::Tab(tab));
+            }
+        }
+    }
+    let mut rows = Vec::with_capacity(workspaces.len());
+    for entry in workspaces {
+        rows.push((entry, None));
+        if let Some(children) =
+            children.remove(snapshot.workspaces[entry.index].workspace_id.as_str())
+        {
+            rows.extend(children.into_iter().map(|child| (entry, Some(child))));
+        }
+    }
+    rows
+}
+
 pub(crate) fn render_sidebar(
     buffer: &mut Buffer,
     area: Rect,
@@ -211,10 +307,16 @@ pub(crate) fn render_sidebar(
     } else {
         Rect::new(area.right().saturating_sub(1), area.y, 1, area.height)
     };
-    let (workspace_area, detail_area) =
-        crate::ui::expanded_sidebar_sections(area, state.sidebar_section_split);
-    hits.sidebar_section_divider =
-        crate::ui::sidebar_section_divider_rect(area, state.sidebar_section_split);
+    let (workspace_area, detail_area) = if config.spaces.unified_tree {
+        (
+            Rect::new(area.x, area.y, area.width.saturating_sub(1), area.height),
+            Rect::default(),
+        )
+    } else {
+        hits.sidebar_section_divider =
+            crate::ui::sidebar_section_divider_rect(area, state.sidebar_section_split);
+        crate::ui::expanded_sidebar_sections(area, state.sidebar_section_split)
+    };
     put_text(
         buffer,
         workspace_area.x,
@@ -226,7 +328,12 @@ pub(crate) fn render_sidebar(
             .add_modifier(Modifier::BOLD),
     );
 
-    let entries = workspace_entries(snapshot, state.collapsed_groups);
+    let entries = space_rows(
+        snapshot,
+        workspace_entries(snapshot, state.collapsed_groups),
+        config,
+        state.folded_spaces,
+    );
     let body = Rect::new(
         workspace_area.x,
         workspace_area.y.saturating_add(WORKSPACE_HEADER_ROWS),
@@ -236,9 +343,18 @@ pub(crate) fn render_sidebar(
             .saturating_sub(WORKSPACE_HEADER_ROWS + 1),
     );
     hits.workspace_body = body;
+    hits.unified_spaces = config.spaces.unified_tree;
     let row_heights = entries
         .iter()
-        .map(|entry| {
+        .map(|(entry, tab)| {
+            match tab {
+                Some(SpaceChild::Agent(row)) => {
+                    return row.rows.len().clamp(1, u16::MAX as usize) as u16
+                }
+                Some(SpaceChild::Pane(_) | SpaceChild::Tab(_)) => return 1,
+                None if config.spaces.unified_tree => return 1,
+                None => {}
+            }
             snapshot
                 .workspaces
                 .get(entry.index)
@@ -260,9 +376,15 @@ pub(crate) fn render_sidebar(
         .iter()
         .enumerate()
         .map(|(index, _)| {
-            entries
-                .get(index + 1)
-                .map_or(0, |next| u16::from(!next.indented) * config.spaces.row_gap)
+            entries.get(index + 1).map_or(0, |(next, tab)| match tab {
+                None if !next.indented => config.spaces.row_gap,
+                Some(SpaceChild::Agent(_))
+                    if matches!(entries[index].1, Some(SpaceChild::Agent(_))) =>
+                {
+                    config.agents.row_gap
+                }
+                _ => 0,
+            })
         })
         .collect::<Vec<_>>();
     let mut metrics = super::scroll::list_scroll_metrics(
@@ -271,11 +393,43 @@ pub(crate) fn render_sidebar(
         body.height,
         *state.workspace_scroll,
     );
-    if !body.is_empty() && std::mem::take(state.reveal_focused_workspace) {
-        if let Some(target) = entries
-            .iter()
-            .position(|entry| snapshot.workspaces[entry.index].focused)
-        {
+    let reveal_navigation = config.spaces.unified_tree
+        && !body.is_empty()
+        && std::mem::take(state.reveal_navigation_workspace);
+    let reveal_focus = !body.is_empty() && std::mem::take(state.reveal_focused_workspace);
+    if reveal_focus || reveal_navigation {
+        let selected = state
+            .selected_workspace_id
+            .filter(|_| reveal_navigation)
+            .and_then(|target| {
+                entries.iter().position(|(entry, tab)| {
+                    tab.is_none()
+                        && target.matches(
+                            state.active_endpoint_id,
+                            &snapshot.workspaces[entry.index].workspace_id,
+                        )
+                })
+            });
+        let target = selected.or_else(|| {
+            if reveal_focus {
+                entries
+                    .iter()
+                    .position(|(_, child)| match child {
+                        Some(SpaceChild::Agent(row)) => row.focused,
+                        Some(SpaceChild::Pane(pane)) => pane.focused,
+                        Some(SpaceChild::Tab(tab)) => tab.focused,
+                        None => false,
+                    })
+                    .or_else(|| {
+                        entries.iter().position(|(entry, child)| {
+                            child.is_none() && snapshot.workspaces[entry.index].focused
+                        })
+                    })
+            } else {
+                None
+            }
+        });
+        if let Some(target) = target {
             *state.workspace_scroll = super::scroll::list_scroll_start_to_reveal(
                 &row_heights,
                 &gaps,
@@ -298,14 +452,90 @@ pub(crate) fn render_sidebar(
         .saturating_sub(metrics.offset_from_bottom);
     let show_scrollbar = metrics.max_offset_from_bottom > 0 && body.width > 1;
     let content_width = body.width.saturating_sub(u16::from(show_scrollbar));
+    let mut folded_summaries = HashMap::<&str, FoldedSummary>::new();
+    if config.spaces.unified_tree && !state.folded_spaces.is_empty() {
+        for pane in &snapshot.panes {
+            if state.folded_spaces.contains(&pane.workspace_id) {
+                folded_summaries
+                    .entry(&pane.workspace_id)
+                    .or_default()
+                    .panes += 1;
+            }
+        }
+        for agent in &snapshot.agents {
+            if state.folded_spaces.contains(&agent.workspace_id) {
+                if let Some(index) = FOLDED_STATUSES
+                    .iter()
+                    .position(|status| *status == agent.agent_status)
+                {
+                    folded_summaries
+                        .entry(&agent.workspace_id)
+                        .or_default()
+                        .statuses[index] += 1;
+                }
+            }
+        }
+    }
     let mut y = body.y;
-    for (entry_position, entry) in entries.iter().enumerate().skip(*state.workspace_scroll) {
+    for (entry_position, (entry, tab)) in entries.iter().enumerate().skip(*state.workspace_scroll) {
+        if y >= body.bottom() {
+            break;
+        }
+        if let Some(SpaceChild::Agent(row)) = tab {
+            let height = row_heights[entry_position].min(body.height);
+            if y.saturating_add(height) > body.bottom() {
+                break;
+            }
+            let rect = Rect::new(body.x, y, content_width, height);
+            let indent = content_width.min(if entry.indented { 3 } else { 1 });
+            let nested = Rect::new(rect.x + indent, y, content_width - indent, height);
+            if row.focused {
+                render_pane_highlight(buffer, rect, indent, palette);
+            }
+            super::super::agent_sidebar::render_agent_row(buffer, nested, row, config);
+            hits.agents.push((rect, row.pane_id.clone()));
+            y = y
+                .saturating_add(height)
+                .saturating_add(gaps[entry_position]);
+            continue;
+        }
+        if let Some(child) = tab {
+            let rect = Rect::new(body.x, y, content_width, 1);
+            let (label, focused) = match child {
+                SpaceChild::Pane(pane) => {
+                    hits.agents.push((rect, pane.pane_id.clone()));
+                    (ordinary_pane_label(pane), pane.focused)
+                }
+                SpaceChild::Tab(tab) => {
+                    hits.space_tabs.push((rect, tab.tab_id.clone()));
+                    (tab.label.as_str(), tab.focused)
+                }
+                SpaceChild::Agent(_) => unreachable!("agent rows render above"),
+            };
+            if focused && snapshot.workspaces[entry.index].focused {
+                let indent = content_width.min(if entry.indented { 3 } else { 1 });
+                render_pane_highlight(buffer, rect, indent, palette);
+            }
+            let x = rect.x.saturating_add(if entry.indented { 6 } else { 4 });
+            put_segment(
+                buffer,
+                x,
+                y,
+                rect.right(),
+                label,
+                Style::default().fg(if focused {
+                    palette.text
+                } else {
+                    palette.subtext0
+                }),
+            );
+            y = y.saturating_add(1).saturating_add(gaps[entry_position]);
+            continue;
+        }
         let Some(workspace) = snapshot.workspaces.get(entry.index) else {
             continue;
         };
-        let status = displayed_workspace_status(snapshot, workspace, state.collapsed_groups);
-        let rows = workspace_rows(workspace, status, entry.indented, &config.spaces);
-        let row_height = (rows.len().max(1).min(u16::MAX as usize) as u16).min(body.height);
+        let row_height = row_heights[entry_position].min(body.height);
         if y.saturating_add(row_height) > body.bottom() {
             break;
         }
@@ -314,34 +544,59 @@ pub(crate) fn render_sidebar(
             target.matches(state.active_endpoint_id, &workspace.workspace_id)
         });
         let dragged = state.dragged_workspace_id == Some(workspace.workspace_id.as_str());
+        let folded =
+            config.spaces.unified_tree && state.folded_spaces.contains(&workspace.workspace_id);
         if selected {
-            buffer.set_style(rect, Style::default().bg(palette.selection_bg));
+            buffer.set_style(
+                rect,
+                Style::default().bg(workspace_selection_background(palette)),
+            );
         } else if dragged {
             buffer.set_style(rect, Style::default().bg(palette.surface1));
-        } else if workspace.focused {
-            buffer.set_style(rect, Style::default().bg(palette.active_row_bg));
+        } else if workspace.focused && !config.spaces.unified_tree {
+            buffer.set_style(
+                rect,
+                Style::default().bg(workspace_active_background(
+                    palette,
+                    state.selected_workspace_id.is_some(),
+                )),
+            );
         }
-        render_workspace_rows(
-            buffer,
-            rect,
-            status,
-            config.status_indicators,
-            entry,
-            rows,
-            workspace.focused,
-            selected,
-            state.selected_workspace_id.is_some(),
-            dragged,
-            palette,
-        );
-        let group_toggle = render_parent_group_toggle(
-            buffer,
-            rect,
-            snapshot,
-            entry.index,
-            state.collapsed_groups,
-            palette,
-        );
+        let group_toggle = if config.spaces.unified_tree {
+            let empty = FoldedSummary::default();
+            let summary = folded.then(|| {
+                folded_summaries
+                    .get(workspace.workspace_id.as_str())
+                    .unwrap_or(&empty)
+            });
+            render_unified_heading(buffer, rect, workspace, entry.indented, summary, config);
+            // Reorder uses the group key. Group collapse is available in the context menu.
+            parent_group_key(snapshot, entry.index).map(|key| (Rect::default(), key))
+        } else {
+            let status = displayed_workspace_status(snapshot, workspace, state.collapsed_groups);
+            let rows = workspace_rows(workspace, status, entry.indented, &config.spaces);
+            render_workspace_rows(
+                buffer,
+                rect,
+                status,
+                config.status_indicators,
+                entry,
+                rows,
+                workspace.focused,
+                selected,
+                state.selected_workspace_id.is_some(),
+                dragged,
+                palette,
+            );
+            render_parent_group_toggle(
+                buffer,
+                rect,
+                snapshot,
+                entry.index,
+                state.collapsed_groups,
+                palette,
+            )
+        };
         hits.workspaces.push(WorkspaceHit {
             rect,
             endpoint_id: ClientEndpointId::Local,
@@ -349,10 +604,9 @@ pub(crate) fn render_sidebar(
             indented: entry.indented,
             group_toggle,
         });
-        let gap = entries
-            .get(entry_position + 1)
-            .map_or(0, |next| u16::from(!next.indented) * config.spaces.row_gap);
-        y = y.saturating_add(row_height + gap);
+        y = y
+            .saturating_add(row_height)
+            .saturating_add(gaps[entry_position]);
     }
 
     if show_scrollbar {
@@ -375,32 +629,38 @@ pub(crate) fn render_sidebar(
         );
     }
 
-    let footer_y = workspace_area.bottom().saturating_sub(1);
+    let footer_area = Rect {
+        width: workspace_area
+            .width
+            .saturating_sub(u16::from(config.spaces.unified_tree)),
+        ..workspace_area
+    };
+    let footer_y = footer_area.bottom().saturating_sub(1);
     if config.mouse_capture {
         hits.new_workspace = Rect::new(
-            workspace_area.x,
+            footer_area.x,
             footer_y,
-            5.min(workspace_area.width),
-            u16::from(workspace_area.height > 0),
+            5.min(footer_area.width),
+            u16::from(footer_area.height > 0),
         );
         put_text(
             buffer,
-            workspace_area.x,
+            footer_area.x,
             footer_y,
-            workspace_area.width,
+            footer_area.width,
             " new",
             Style::default().fg(palette.overlay0),
         );
         let attention = super::super::global_menu::global_menu_attention(snapshot);
-        let launcher_width = if attention { 8 } else { 6 }.min(workspace_area.width);
+        let launcher_width = if attention { 8 } else { 6 }.min(footer_area.width);
         hits.global_launcher = Rect::new(
-            workspace_area.right().saturating_sub(launcher_width),
+            footer_area.right().saturating_sub(launcher_width),
             footer_y,
             launcher_width,
             1,
         );
         if attention {
-            let start_x = workspace_area.right().saturating_sub(6);
+            let start_x = footer_area.right().saturating_sub(6);
             put_text(
                 buffer,
                 start_x,
@@ -422,7 +682,7 @@ pub(crate) fn render_sidebar(
         } else {
             put_right_text(
                 buffer,
-                workspace_area,
+                footer_area,
                 footer_y,
                 "menu",
                 Style::default().fg(palette.overlay0),
@@ -660,13 +920,8 @@ pub(in crate::client::shell) fn displayed_workspace_status(
         .unwrap_or(workspace.agent_status)
 }
 
-pub(in crate::client::shell) fn workspace_rows(
-    workspace: &ClientShellWorkspace,
-    status: crate::api::schema::AgentStatus,
-    indented: bool,
-    config: &SpacesSidebarConfig,
-) -> Vec<Vec<crate::ui::ResolvedToken>> {
-    let label = if indented && !workspace.custom_label {
+fn workspace_label(workspace: &ClientShellWorkspace, indented: bool) -> &str {
+    if indented && !workspace.custom_label {
         workspace
             .branch
             .as_deref()
@@ -674,7 +929,94 @@ pub(in crate::client::shell) fn workspace_rows(
             .unwrap_or(&workspace.label)
     } else {
         &workspace.label
-    };
+    }
+}
+
+fn ordinary_pane_label(pane: &crate::protocol::ClientShellPane) -> &str {
+    pane.label
+        .as_deref()
+        .filter(|label| !label.is_empty())
+        .or_else(|| {
+            let cwd = pane.foreground_cwd.as_deref().or(pane.cwd.as_deref())?;
+            let name = cwd
+                .trim_end_matches(['/', '\\'])
+                .rsplit(['/', '\\'])
+                .next()?;
+            Some(if name.is_empty() { cwd } else { name })
+        })
+        .unwrap_or(&pane.pane_id)
+}
+
+fn render_unified_heading(
+    buffer: &mut Buffer,
+    area: Rect,
+    workspace: &ClientShellWorkspace,
+    indented: bool,
+    summary: Option<&FoldedSummary>,
+    config: &ClientShellConfig,
+) {
+    let palette = &config.palette;
+    let label = workspace_label(workspace, indented);
+    let style = Style::default().fg(palette.accent);
+    let style = config
+        .spaces
+        .rows
+        .iter()
+        .flatten()
+        .find(|token| matches!(token.parts().0, crate::config::SpaceSidebarToken::Workspace))
+        .and_then(|token| token.style_for_value(label))
+        .map_or(style, |patch| crate::ui::sidebar_token_style(style, patch));
+    let indent = area.width.min(if indented { 2 } else { 0 });
+    let mut width = area.width - indent;
+    if let Some(summary) = summary {
+        let suffix = format!("[{}]", summary.panes);
+        let suffix_width = display_width(&suffix);
+        if width > suffix_width + 1 {
+            put_right_text(
+                buffer,
+                area,
+                area.y,
+                &suffix,
+                Style::default().fg(palette.overlay0),
+            );
+            width -= suffix_width + 1;
+        }
+    }
+    let mut statuses = Vec::new();
+    if let Some(summary) = summary {
+        for (status, count) in FOLDED_STATUSES.into_iter().zip(summary.statuses) {
+            if count > 0 {
+                let segment = format!(" {} {count}", status_icon(status, config.status_indicators));
+                let segment_width = display_width(&segment);
+                if width.saturating_sub(segment_width) >= display_width(label).min(4) {
+                    width -= segment_width;
+                    statuses.push((segment, status_color(status, palette)));
+                }
+            }
+        }
+    }
+    let label = crate::ui::truncate_end(label, usize::from(width));
+    put_text(buffer, area.x + indent, area.y, width, &label, style);
+    let mut x = area.x + indent + display_width(&label);
+    for (segment, color) in statuses {
+        x = put_segment(
+            buffer,
+            x,
+            area.y,
+            area.right(),
+            &segment,
+            Style::default().fg(color),
+        );
+    }
+}
+
+pub(in crate::client::shell) fn workspace_rows(
+    workspace: &ClientShellWorkspace,
+    status: crate::api::schema::AgentStatus,
+    indented: bool,
+    config: &SpacesSidebarConfig,
+) -> Vec<Vec<crate::ui::ResolvedToken>> {
+    let label = workspace_label(workspace, indented);
     let token_values = workspace.tokens.iter().cloned().collect::<HashMap<_, _>>();
     crate::ui::sidebar_space_rows(
         config,

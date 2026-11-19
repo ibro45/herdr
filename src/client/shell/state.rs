@@ -85,6 +85,8 @@ pub(super) enum ClientMobileTarget {
 pub(super) struct ShellHitMap {
     pub(super) machines: Vec<MachineHit>,
     pub(super) workspaces: Vec<WorkspaceHit>,
+    pub(super) space_tabs: Vec<(Rect, String)>,
+    pub(super) unified_spaces: bool,
     pub(super) workspace_body: Rect,
     pub(super) workspace_scrollbar: Rect,
     pub(super) workspace_scroll_metrics: Option<crate::pane::ScrollMetrics>,
@@ -880,6 +882,7 @@ pub(crate) struct ClientShellState {
     pub(super) chrome_drag: Option<ClientChromeDrag>,
     pub(super) workspace_press: Option<ClientWorkspacePress>,
     pub(super) tab_press: Option<ClientTabPress>,
+    pub(super) folded_spaces: HashSet<String>,
     pub(super) collapsed_groups: HashSet<String>,
     pub(super) remote_collapsed_groups: HashMap<ClientEndpointId, HashSet<String>>,
     pub(super) workspace_scroll: usize,
@@ -1054,6 +1057,7 @@ impl ClientShellState {
             chrome_drag: None,
             workspace_press: None,
             tab_press: None,
+            folded_spaces: HashSet::new(),
             collapsed_groups: preferences.collapsed_groups.into_iter().collect(),
             remote_collapsed_groups,
             workspace_scroll: 0,
@@ -1170,6 +1174,12 @@ impl ClientShellState {
             .is_some_and(|groups| groups.contains(key))
     }
 
+    pub(super) fn toggle_space_fold(&mut self, id: String) {
+        if !self.folded_spaces.remove(&id) {
+            self.folded_spaces.insert(id);
+        }
+    }
+
     pub(super) fn toggle_collapsed_group(&mut self, endpoint_id: &ClientEndpointId, key: String) {
         let groups = if endpoint_id.is_local() {
             &mut self.collapsed_groups
@@ -1209,7 +1219,24 @@ impl ClientShellState {
             return;
         }
         let target = self.snapshot.as_deref().and_then(|snapshot| {
-            self.navigation_workspace_entries(snapshot)
+            let workspaces = self.navigation_workspace_entries(snapshot);
+            if self.config.spaces.unified_tree
+                && !self.sidebar_collapsed
+                && !self.multi_endpoint_active()
+                && !self.mobile_layout_active()
+            {
+                return sidebar::space_rows(
+                    snapshot,
+                    workspaces,
+                    &self.config,
+                    &self.folded_spaces,
+                )
+                .iter()
+                .position(|(entry, tab)| {
+                    tab.is_none() && snapshot.workspaces[entry.index].workspace_id == workspace_id
+                });
+            }
+            workspaces
                 .iter()
                 .position(|entry| snapshot.workspaces[entry.index].workspace_id == workspace_id)
         });
@@ -1320,6 +1347,16 @@ impl ClientShellState {
         {
             return;
         }
+        if endpoint_boot_changed {
+            self.folded_spaces.clear();
+        } else if !self.folded_spaces.is_empty() {
+            let spaces: HashSet<_> = snapshot
+                .workspaces
+                .iter()
+                .map(|space| space.workspace_id.as_str())
+                .collect();
+            self.folded_spaces.retain(|id| spaces.contains(id.as_str()));
+        }
         // Screen revisions restart per connection. Keep the displayed surface for selection
         // content comparisons, but retire speculative frames from the old connection.
         if generation_changed {
@@ -1427,6 +1464,15 @@ impl ClientShellState {
             .as_deref()
             .and_then(|current| current.focused_workspace_id.as_deref())
             != snapshot.focused_workspace_id.as_deref()
+            || (self.config.spaces.unified_tree
+                && !self.sidebar_collapsed
+                && !self.multi_endpoint_active()
+                && !self.mobile_layout_active()
+                && self
+                    .snapshot
+                    .as_deref()
+                    .and_then(|current| current.focused_pane_id.as_deref())
+                    != snapshot.focused_pane_id.as_deref())
         {
             self.reveal_focused_workspace = true;
         }

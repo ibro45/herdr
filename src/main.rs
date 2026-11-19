@@ -361,6 +361,10 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Custom values reported through workspace metadata use a $name token, for example $jj_status.
 # Inline token styles accept strict #RGB/#RRGGBB foregrounds plus bold and dim booleans.
 # [ui.sidebar.spaces]
+# Group agents and agentless tabs under foldable space headings in the expanded single-machine sidebar.
+# unified_tree = false
+# Show individual ordinary panes alongside agents in the unified sidebar.
+# show_other_panes = false
 # Blank rows between space entries. Set to 1 to restore the previous spacing.
 # row_gap = 0
 # rows = [["state_icon", "workspace"], ["branch", "git_status"]]

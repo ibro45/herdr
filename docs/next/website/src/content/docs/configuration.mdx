@@ -372,12 +372,16 @@ rows = [
 ]
 
 [ui.sidebar.spaces]
+unified_tree = false
+show_other_panes = false
 row_gap = 0
 rows = [
   ["state_icon", "workspace"],
   ["branch", "git_status"],
 ]
 ```
+
+In the expanded single-machine sidebar, set `unified_tree = true` to group agents and agentless tabs under their Space in one list. Click a Space heading to fold or expand it. A folded heading shows native agent status totals beside the name and a muted pane count in brackets on the right. Headings use regular-weight accent text by default. The first configured `workspace` token in `ui.sidebar.spaces.rows` can override that style, including with matching rules. Right-click a worktree parent to collapse or expand its worktree group. Click an agent to focus its pane, including when several agents share a tab. Click an ordinary tab to focus it. Agent rows use the configured token rows and styles, with the Space name supplied by the heading. The client remembers folds until it exits or the server restarts. Set `show_other_panes = true` to list and focus ordinary panes individually, even in tabs that also contain agents.
 
 Agent rows accept these built-in tokens:
 

@@ -527,3 +527,131 @@ fn close_confirmation_error_becomes_client_owned_overlay_and_stable_workspace_cl
             if params.workspace_id == "ws_1" && !params.close_group
     ));
 }
+
+#[test]
+fn workspace_shortcut_reveals_heading_after_scrolled_tab_children() {
+    let mut config = Config::default();
+    config.ui.sidebar.spaces.unified_tree = true;
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
+    let mut data = snapshot();
+    let mut other = data.workspaces[0].clone();
+    other.workspace_id = "other".into();
+    other.active_tab_id = "other:1".into();
+    other.focused = false;
+    data.workspaces.push(other);
+    let template = data.tabs[0].clone();
+    for number in 2..=25 {
+        data.tabs.push(ClientShellTab {
+            tab_id: format!("tab_{number}"),
+            number,
+            focused: false,
+            ..template.clone()
+        });
+    }
+    data.tabs.push(ClientShellTab {
+        workspace_id: "other".into(),
+        tab_id: "other:1".into(),
+        focused: false,
+        ..template
+    });
+    state.set_snapshot(Box::new(data));
+    state.set_pane_surface(surface());
+    state.compose(106, 20).unwrap();
+    assert!(state
+        .hits
+        .workspaces
+        .iter()
+        .all(|hit| hit.workspace_id != "other"));
+    state.reveal_workspace("other");
+    state.compose(106, 20).unwrap();
+    assert!(state
+        .hits
+        .workspaces
+        .iter()
+        .any(|hit| hit.workspace_id == "other"));
+}
+
+#[test]
+fn unified_headings_show_names_and_folded_pane_counts_without_indicators() {
+    let config: Config = toml::from_str(r##"
+[ui.sidebar.spaces]
+unified_tree = true
+rows = [["state_icon", {token = "workspace", rules = [{equals = "Project", fg = "#129abc"}]}], ["branch"]]
+"##).unwrap();
+    let mut data = snapshot();
+    data.workspaces[0].label = "Project".into();
+    data.workspaces[0].agent_status = AgentStatus::Blocked;
+    data.tabs[0].label = "Dev server".into();
+    for id in ["second", "third"] {
+        let mut pane = data.panes[0].clone();
+        pane.pane_id = id.into();
+        data.panes.push(pane);
+    }
+    let mut other = data.workspaces[0].clone();
+    other.workspace_id = "other".into();
+    other.label = "Other".into();
+    other.focused = false;
+    data.workspaces.push(other);
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
+    state.set_snapshot(Box::new(data));
+    state.set_pane_surface(surface());
+    let frame = state.compose(106, 40).unwrap();
+    let header = state.hits.workspaces[0].rect;
+    let tab = state.hits.space_tabs[0].0;
+    let row = |frame: &FrameData, rect: Rect| -> String {
+        frame_rows(frame)[rect.y as usize]
+            .chars()
+            .skip(rect.x as usize)
+            .take(rect.width as usize)
+            .collect()
+    };
+    assert_eq!(header.height, 1);
+    assert_eq!(row(&frame, header).trim_end(), "Project");
+    assert_eq!(
+        frame.cells[(header.y * frame.width + header.x) as usize].fg,
+        crate::protocol::color_to_u32(ratatui::style::Color::Rgb(0x12, 0x9a, 0xbc))
+    );
+    let heading_cell = |frame: &FrameData, rect: Rect| {
+        frame.cells[usize::from(rect.y * frame.width + rect.x)].clone()
+    };
+    let other = state.hits.workspaces[1].rect;
+    assert_eq!(
+        heading_cell(&frame, other).fg,
+        crate::protocol::color_to_u32(state.config.palette.accent)
+    );
+    assert_eq!(
+        heading_cell(&frame, header).modifier & crate::protocol::modifier_to_u16(Modifier::BOLD),
+        0
+    );
+    assert_eq!(row(&frame, tab).trim(), "▌   Dev server");
+    state.toggle_space_fold("ws_1".into());
+    let folded = state.compose(106, 40).unwrap();
+    assert_eq!(
+        heading_cell(&folded, header).bg,
+        heading_cell(&frame, header).bg
+    );
+    let line = row(&folded, header);
+    assert!(line.starts_with("Project"));
+    assert!(line.ends_with("[3]"));
+    let count_cell = |frame: &FrameData| {
+        frame.cells[usize::from(header.y * frame.width + header.right() - 1)].fg
+    };
+    assert_eq!(
+        count_cell(&folded),
+        crate::protocol::color_to_u32(state.config.palette.overlay0)
+    );
+    let mut updated = state.snapshot.as_deref().unwrap().clone();
+    updated.panes.truncate(1);
+    updated.workspaces[0].agent_status = AgentStatus::Done;
+    updated.revision += 1;
+    let mut next_surface = surface();
+    next_surface.projection_revision = updated.revision;
+    state.set_snapshot(Box::new(updated));
+    state.set_pane_surface(next_surface);
+    let completed = state.compose(106, 40).unwrap();
+    assert!(row(&completed, header).ends_with("[1]"));
+    assert_eq!(
+        count_cell(&completed),
+        crate::protocol::color_to_u32(state.config.palette.overlay0)
+    );
+}
